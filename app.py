@@ -140,9 +140,13 @@ def make_preprocessor(X):
             ("scaler", StandardScaler())
         ]), num_cols))
     if cat_cols:
+        try:
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+        except TypeError:
+            encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
         transformers.append(("cat", Pipeline([
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+            ("encoder", encoder)
         ]), cat_cols))
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
@@ -180,17 +184,17 @@ def to_excel_bytes(df):
         name = str(col).lower()
         is_date_name = any(x in name for x in ("date", "time", "التاريخ", "تاريخ", "وقت"))
         if pd.api.types.is_datetime64_any_dtype(s):
-            parsed = pd.to_datetime(s, errors="coerce")
+            parsed = pd.to_datetime(s, errors="coerce", format="mixed")
             if parsed.notna().mean() >= .6:
                 date_cols[col] = parsed
         elif is_date_name and not pd.api.types.is_numeric_dtype(s):
-            parsed = pd.to_datetime(s, errors="coerce")
+            parsed = pd.to_datetime(s, errors="coerce", format="mixed")
             if len(s) and parsed.notna().mean() >= .6:
                 date_cols[col] = parsed
         elif not pd.api.types.is_numeric_dtype(s) and s.notna().any():
             sample = s.dropna().astype(str).head(200)
             if len(sample) >= 5 and sample.str.contains(r"[-/]", regex=True).mean() >= .7:
-                parsed = pd.to_datetime(s, errors="coerce")
+                parsed = pd.to_datetime(s, errors="coerce", format="mixed")
                 if parsed.notna().mean() >= .8:
                     date_cols[col] = parsed
 
@@ -739,7 +743,7 @@ with st.sidebar:
         st.markdown("---")
         st.caption(f"الملف الحالي: {st.session_state.source_name}")
         st.caption(f"{len(st.session_state.df):,} صف × {len(st.session_state.df.columns):,} عمود")
-        if st.button("إزالة الملف الحالي", use_container_width=True):
+        if st.button("إزالة الملف الحالي", width="stretch"):
             for k in ["df", "clean_df", "trained_model", "model_info", "automl_results", "outlier_df", "cluster_df"]:
                 st.session_state[k] = None
             st.session_state.source_name = ""
@@ -771,7 +775,7 @@ if df is None:
         "Churn": ["No","No","Yes","No","Yes","No","No","Yes","No","No","Yes","No"]
     })
     st.markdown("#### معاينة توضيحية")
-    st.dataframe(demo, use_container_width=True, hide_index=True)
+    st.dataframe(demo, width="stretch", hide_index=True)
     st.info("ارفع ملفك من القائمة الجانبية لفتح أدوات التحليل الفعلية.")
     st.stop()
 
@@ -791,21 +795,21 @@ with tabs[0]:
     with c4: metric_card("صفوف مكررة", f"{duplicate_count:,}", "Duplicates")
     with c5: metric_card("استهلاك الذاكرة", f"{active_df.memory_usage(deep=True).sum()/1024**2:.2f} MB", "Approx.")
     st.markdown("### معاينة البيانات")
-    st.dataframe(active_df.head(100), use_container_width=True, hide_index=True)
+    st.dataframe(active_df.head(100), width="stretch", hide_index=True)
     left, right = st.columns(2)
     with left:
         st.markdown("### أنواع الأعمدة")
         types_df = active_df.dtypes.astype(str).value_counts().rename_axis("Data Type").reset_index(name="Columns")
         fig = px.bar(types_df, x="Data Type", y="Columns", color="Data Type", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with right:
         st.markdown("### القيم المفقودة حسب العمود")
         miss_df = active_df.isna().sum().sort_values(ascending=False).head(20).reset_index()
         miss_df.columns = ["Column", "Missing"]
         fig = px.bar(miss_df, x="Missing", y="Column", orientation="h", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", yaxis={"categoryorder":"total ascending"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     st.markdown("### الملف الشخصي للأعمدة")
     profile = pd.DataFrame({
         "Column": active_df.columns,
@@ -815,7 +819,7 @@ with tabs[0]:
         "Missing %": [round(active_df[c].isna().mean()*100, 2) for c in active_df.columns],
         "Unique": [int(active_df[c].nunique(dropna=True)) for c in active_df.columns]
     })
-    st.dataframe(profile, use_container_width=True, hide_index=True)
+    st.dataframe(profile, width="stretch", hide_index=True)
 
 with tabs[1]:
     st.markdown("### تحليل تلقائي استكشافي")
@@ -834,24 +838,24 @@ with tabs[1]:
         with f1:
             fig = px.histogram(active_df, x=col, nbins=30, title=f"Distribution: {col}", template="plotly_dark")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         with f2:
             fig = px.box(active_df, y=col, title=f"Outlier overview: {col}", template="plotly_dark")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
     if cat_cols:
         col_cat = st.selectbox("اختر عمودًا فئويًا", cat_cols, key="auto_cat_col")
         counts = active_df[col_cat].astype("string").fillna("(Missing)").value_counts().head(20).reset_index()
         counts.columns = [col_cat, "Count"]
         fig = px.bar(counts, x=col_cat, y="Count", title=f"Top categories: {col_cat}", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", xaxis_tickangle=-25)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     if len(num_cols) >= 2:
         st.markdown("### ارتباط الأعمدة الرقمية")
         corr = active_df[num_cols].corr(numeric_only=True)
         fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="Tealrose", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 with tabs[2]:
     st.markdown("### جودة البيانات والتنظيف")
@@ -866,7 +870,7 @@ with tabs[2]:
         fill_categorical = st.selectbox("القيم المفقودة النصية", ["Most frequent", "Fill with Unknown", "Leave unchanged"], index=0)
         trim_text = st.checkbox("إزالة المسافات الزائدة من النصوص", value=True)
         normalize_headers = st.checkbox("تنسيق أسماء الأعمدة (اختياري)", value=False)
-        submitted = st.form_submit_button("🧹 إنشاء نسخة نظيفة", use_container_width=True)
+        submitted = st.form_submit_button("🧹 إنشاء نسخة نظيفة", width="stretch")
     if submitted:
         cleaned = active_df.copy()
         if trim_text:
@@ -890,12 +894,12 @@ with tabs[2]:
         st.success(f"تم إنشاء النسخة النظيفة: {len(cleaned):,} صف × {len(cleaned.columns):,} عمود")
     if st.session_state.clean_df is not None:
         st.markdown("### معاينة النسخة النظيفة")
-        st.dataframe(st.session_state.clean_df.head(100), use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state.clean_df.head(100), width="stretch", hide_index=True)
         d1,d2 = st.columns(2)
         with d1:
-            st.download_button("تنزيل CSV النظيف", to_csv_bytes(st.session_state.clean_df), file_name="cleaned_dataset.csv", mime="text/csv", use_container_width=True)
+            st.download_button("تنزيل CSV النظيف", to_csv_bytes(st.session_state.clean_df), file_name="cleaned_dataset.csv", mime="text/csv", width="stretch")
         with d2:
-            st.download_button("تنزيل Excel النظيف", to_excel_bytes(st.session_state.clean_df), file_name="cleaned_dataset.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button("تنزيل Excel النظيف", to_excel_bytes(st.session_state.clean_df), file_name="cleaned_dataset.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
         if st.button("إلغاء النسخة النظيفة والعودة للأصل"):
             st.session_state.clean_df = None
             st.rerun()
@@ -918,7 +922,7 @@ with tabs[3]:
         feature_options = [c for c in ml_df.columns if c != target]
         selected_features = st.multiselect("الأعمدة المستخدمة كمدخلات (Features)", feature_options, default=feature_options[:min(len(feature_options), 30)], key="ml_features")
         test_size = st.slider("نسبة بيانات الاختبار", min_value=0.1, max_value=0.4, value=0.2, step=0.05, key="ml_test_size")
-        run_automl = st.button("🚀 تدريب ومقارنة النماذج", use_container_width=True)
+        run_automl = st.button("🚀 تدريب ومقارنة النماذج", width="stretch")
         if run_automl:
             if not selected_features:
                 st.error("اختر عمودًا واحدًا على الأقل كمدخل.")
@@ -966,12 +970,12 @@ with tabs[3]:
                             st.session_state.model_info = {"task": actual_task, "target": target, "features": list(X.columns), "model": best_name, "score": float(result_df.iloc[0]["F1 (weighted)"]), "classes": sorted(y.unique().tolist())}
                             st.session_state.automl_results = result_df
                             st.success(f"اكتمل التدريب. أفضل نموذج: {best_name}")
-                            st.dataframe(result_df.style.format({c:"{:.3f}" for c in result_df.columns if c != "Model"}), use_container_width=True, hide_index=True)
+                            st.dataframe(result_df.style.format({c:"{:.3f}" for c in result_df.columns if c != "Model"}), width="stretch", hide_index=True)
                             labels = sorted(pd.Series(yte).astype(str).unique().tolist())
                             cm = confusion_matrix(yte, best_pred, labels=labels)
                             fig = px.imshow(cm, x=labels, y=labels, text_auto=True, title=f"Confusion Matrix — {best_name}", labels=dict(x="Predicted", y="Actual", color="Count"), template="plotly_dark", color_continuous_scale="Teal")
                             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width="stretch")
                             st.markdown("#### تقرير التصنيف")
                             st.code(classification_report(yte, best_pred, zero_division=0))
                         else:
@@ -1002,11 +1006,11 @@ with tabs[3]:
                                 st.session_state.model_info = {"task": actual_task, "target": target, "features": list(X.columns), "model": best_name, "score": float(result_df.iloc[0]["RMSE"])}
                                 st.session_state.automl_results = result_df
                                 st.success(f"اكتمل التدريب. أفضل نموذج حسب RMSE: {best_name}")
-                                st.dataframe(result_df.style.format({c:"{:.3f}" for c in result_df.columns if c != "Model"}), use_container_width=True, hide_index=True)
+                                st.dataframe(result_df.style.format({c:"{:.3f}" for c in result_df.columns if c != "Model"}), width="stretch", hide_index=True)
                                 compare = pd.DataFrame({"Actual": yte.to_numpy(), "Predicted": best_pred})
                                 fig = px.scatter(compare, x="Actual", y="Predicted", title=f"Actual vs Predicted — {best_name}", template="plotly_dark", trendline="ols")
                                 fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                                st.plotly_chart(fig, use_container_width=True)
+                                st.plotly_chart(fig, width="stretch")
                     except Exception as e:
                         st.error(f"تعذر تدريب النموذج: {type(e).__name__}: {e}")
                         st.info("جرّب هدفًا آخر، أو قلل الأعمدة المختارة، أو تأكد أن البيانات تحتوي على صفوف كافية.")
@@ -1024,7 +1028,7 @@ with tabs[4]:
     else:
         cluster_features = st.multiselect("الأعمدة الرقمية", numeric_cols, default=numeric_cols[:min(4,len(numeric_cols))], key="cluster_features")
         k = st.slider("عدد المجموعات (K)", 2, min(10, max(2, len(active_df)-1)), 3, key="cluster_k")
-        if st.button("اكتشاف المجموعات", use_container_width=True):
+        if st.button("اكتشاف المجموعات", width="stretch"):
             if len(cluster_features) < 2:
                 st.error("اختر عمودين رقميين على الأقل.")
             else:
@@ -1046,8 +1050,8 @@ with tabs[4]:
                     if len(cluster_features) >= 2:
                         fig = px.scatter(result, x=cluster_features[0], y=cluster_features[1], color="Cluster", title="Cluster map", template="plotly_dark")
                         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                        st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(result, use_container_width=True, hide_index=True)
+                        st.plotly_chart(fig, width="stretch")
+                    st.dataframe(result, width="stretch", hide_index=True)
                     st.download_button("تنزيل نتائج Clustering", to_csv_bytes(result), file_name="cluster_results.csv", mime="text/csv")
     if st.session_state.cluster_df is not None:
         st.caption("آخر نتائج التجميع محفوظة في الجلسة.")
@@ -1061,7 +1065,7 @@ with tabs[5]:
     else:
         anomaly_features = st.multiselect("اختر أعمدة الفحص", num_cols, default=num_cols[:min(5,len(num_cols))], key="anomaly_features")
         contamination = st.slider("النسبة المتوقعة للحالات الشاذة", 0.01, 0.20, 0.05, 0.01, key="contamination")
-        if st.button("🔍 فحص الحالات الشاذة", use_container_width=True):
+        if st.button("🔍 فحص الحالات الشاذة", width="stretch"):
             if not anomaly_features:
                 st.error("اختر عمودًا رقميًا واحدًا على الأقل.")
             else:
@@ -1085,8 +1089,8 @@ with tabs[5]:
                     with c: metric_card("النسبة", f"{n/len(temp)*100:.1f}%")
                     fig = px.histogram(out, x="Anomaly_Score", color="Anomaly_Status", title="Anomaly score distribution", template="plotly_dark")
                     fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(st.session_state.outlier_df.head(200), use_container_width=True, hide_index=True)
+                    st.plotly_chart(fig, width="stretch")
+                    st.dataframe(st.session_state.outlier_df.head(200), width="stretch", hide_index=True)
                     st.download_button("تنزيل نتائج الفحص", to_csv_bytes(st.session_state.outlier_df), file_name="anomaly_detection.csv", mime="text/csv")
     if st.session_state.outlier_df is not None:
         st.caption("آخر نتائج اكتشاف الشذوذ محفوظة في الجلسة.")
@@ -1102,7 +1106,7 @@ with tabs[6]:
             data=pdf_report,
             file_name="AI_Data_Quality_Report.pdf",
             mime="application/pdf",
-            use_container_width=True
+            width="stretch"
         )
     except Exception as report_error:
         st.error(f"تعذر إنشاء تقرير PDF: {report_error}")
@@ -1111,17 +1115,17 @@ with tabs[6]:
             data=make_report(report_df, st.session_state.source_name),
             file_name="data_quality_report.txt",
             mime="text/plain",
-            use_container_width=True
+            width="stretch"
         )
     c1,c2,c3 = st.columns(3)
     with c1:
-        st.download_button("تنزيل CSV", to_csv_bytes(report_df), file_name="dataset_export.csv", mime="text/csv", use_container_width=True)
+        st.download_button("تنزيل CSV", to_csv_bytes(report_df), file_name="dataset_export.csv", mime="text/csv", width="stretch")
     with c2:
-        st.download_button("📊 تنزيل Excel مع Dashboard", to_excel_bytes(report_df), file_name="dataset_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("📊 تنزيل Excel مع Dashboard", to_excel_bytes(report_df), file_name="dataset_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
     with c3:
-        st.download_button("تنزيل JSON", safe_frame(report_df).to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"), file_name="dataset_export.json", mime="application/json", use_container_width=True)
+        st.download_button("تنزيل JSON", safe_frame(report_df).to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"), file_name="dataset_export.json", mime="application/json", width="stretch")
     st.markdown("### إحصاءات وصفية")
-    st.dataframe(report_df.describe(include="all").transpose(), use_container_width=True)
+    st.dataframe(report_df.describe(include="all").transpose(), width="stretch")
 
 with tabs[7]:
     st.markdown("### SQL & Automation")
@@ -1131,7 +1135,7 @@ with tabs[7]:
     safe_table = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in safe_table)
     if not safe_table:
         safe_table = "dataset_records"
-    if st.button("إنشاء قاعدة SQLite للتنزيل", use_container_width=True):
+    if st.button("إنشاء قاعدة SQLite للتنزيل", width="stretch"):
         try:
             buffer = io.BytesIO()
             with sqlite3.connect(":memory:") as conn:
@@ -1152,7 +1156,7 @@ with tabs[7]:
                     try: os.remove(temp_path)
                     except Exception: pass
                 backup.close()
-            st.download_button("⬇️ تنزيل قاعدة SQLite", db_bytes, file_name="dataset_database.sqlite", mime="application/vnd.sqlite3", use_container_width=True)
+            st.download_button("⬇️ تنزيل قاعدة SQLite", db_bytes, file_name="dataset_database.sqlite", mime="application/vnd.sqlite3", width="stretch")
             st.success("تم تجهيز قاعدة SQLite.")
         except Exception as e:
             st.error(f"تعذر إنشاء SQLite: {e}")
@@ -1166,7 +1170,7 @@ with tabs[7]:
     sql_lines.append(",\n".join(cols))
     sql_lines.append(");")
     sql_script = "\n".join(sql_lines) + "\n\n-- Insert data from the exported CSV/Excel using your SQL client.\n"
-    st.download_button("تنزيل SQL Schema", sql_script.encode("utf-8"), file_name="dataset_schema.sql", mime="application/sql", use_container_width=True)
+    st.download_button("تنزيل SQL Schema", sql_script.encode("utf-8"), file_name="dataset_schema.sql", mime="application/sql", width="stretch")
     st.markdown("### سجل إجراءات الجلسة")
     activity = [
         {"Action": "Dataset loaded", "Status": "Done", "Details": st.session_state.source_name},
@@ -1175,7 +1179,7 @@ with tabs[7]:
         {"Action": "Clustering", "Status": "Done" if st.session_state.cluster_df is not None else "Not run", "Details": "K-Means"},
         {"Action": "Anomaly detection", "Status": "Done" if st.session_state.outlier_df is not None else "Not run", "Details": "Isolation Forest"}
     ]
-    st.dataframe(pd.DataFrame(activity), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(activity), width="stretch", hide_index=True)
 
 st.markdown("---")
 st.markdown('<div class="small-muted">AI Data Intelligence Pro • النتائج استكشافية وتعتمد على جودة البيانات. راجع مخرجات النماذج قبل استخدامها في قرارات مهمة.</div>', unsafe_allow_html=True)
