@@ -2,6 +2,9 @@
 import io
 import os
 import json
+import csv
+import gc
+import tempfile
 import sqlite3
 import warnings
 from datetime import datetime
@@ -95,21 +98,97 @@ def metric_card(label, value, note=""):
     )
 
 def read_dataset(uploaded):
+    """Read supported datasets with lower peak memory, especially large XLSX files."""
     name = uploaded.name.lower()
+    uploaded.seek(0)
+
     if name.endswith(".csv"):
         try:
-            return pd.read_csv(uploaded)
+            return pd.read_csv(uploaded, low_memory=True, on_bad_lines="error")
         except UnicodeDecodeError:
             uploaded.seek(0)
-            return pd.read_csv(uploaded, encoding="latin-1")
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded)
+            return pd.read_csv(uploaded, encoding="latin-1", low_memory=True, on_bad_lines="error")
+
+    if name.endswith(".xlsx"):
+        from openpyxl import load_workbook
+        temp_path = None
+        workbook = None
+        try:
+            workbook = load_workbook(uploaded, read_only=True, data_only=True)
+            worksheet = workbook.active
+            row_iterator = worksheet.iter_rows(values_only=True)
+            headers = next(row_iterator, None)
+            if headers is None:
+                return pd.DataFrame()
+
+            headers = [str(value).strip() if value is not None and str(value).strip() else f"Column_{i+1}"
+                       for i, value in enumerate(headers)]
+            # Make duplicate headers unique, as pandas normally does when reading Excel.
+            seen = {}
+            unique_headers = []
+            for header in headers:
+                seen[header] = seen.get(header, 0) + 1
+                unique_headers.append(header if seen[header] == 1 else f"{header}.{seen[header]-1}")
+
+            with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8", suffix=".csv", delete=False) as temp_file:
+                temp_path = temp_file.name
+                writer = csv.writer(temp_file)
+                writer.writerow(unique_headers)
+                for row in row_iterator:
+                    converted = []
+                    for value in row:
+                        if isinstance(value, datetime):
+                            converted.append(value.isoformat(sep=" "))
+                        elif hasattr(value, "isoformat"):
+                            converted.append(value.isoformat())
+                        else:
+                            converted.append(value)
+                    writer.writerow(converted)
+
+            del row_iterator
+            workbook.close()
+            workbook = None
+            result = pd.read_csv(temp_path, low_memory=True)
+            return result
+        finally:
+            if workbook is not None:
+                workbook.close()
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            gc.collect()
+
+    if name.endswith(".xls"):
+        return pd.read_excel(uploaded, engine="xlrd")
     if name.endswith(".json"):
         uploaded.seek(0)
         return pd.read_json(uploaded)
     if name.endswith(".parquet"):
+        uploaded.seek(0)
         return pd.read_parquet(uploaded)
-    raise ValueError("الصيغة غير مدعومة.")
+    raise ValueError("الصيغة غير مدعومة. استخدم CSV أو XLSX أو XLS أو JSON أو Parquet.")
+
+
+def safe_duplicate_count(frame, max_rows=200_000):
+    """Avoid a large temporary hash array on very large datasets."""
+    if len(frame) > max_rows:
+        return None
+    return int(frame.duplicated().sum())
+
+
+def safe_unique_count(series, max_rows=200_000):
+    if len(series) <= max_rows:
+        return int(series.nunique(dropna=True)), False
+    sample = series.sample(n=min(100_000, len(series)), random_state=42)
+    return int(sample.nunique(dropna=True)), True
+
+
+def plot_sample(frame, max_rows=50_000):
+    if len(frame) <= max_rows:
+        return frame
+    return frame.sample(n=max_rows, random_state=42)
 
 def classify_task(series):
     non_null = series.dropna()
@@ -151,10 +230,12 @@ def make_preprocessor(X):
     return ColumnTransformer(transformers=transformers, remainder="drop")
 
 def safe_frame(df):
+    datetime_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if not datetime_cols:
+        return df
     out = df.copy()
-    for col in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[col]):
-            out[col] = out[col].astype(str)
+    for col in datetime_cols:
+        out[col] = out[col].astype(str)
     return out
 
 def to_csv_bytes(df):
@@ -721,24 +802,31 @@ with st.sidebar:
     st.markdown("## 🧠 AI Intelligence")
     st.markdown('<span class="badge">PRO • DATA LAB</span>', unsafe_allow_html=True)
     st.markdown("---")
-    uploaded = st.file_uploader("حمّل Dataset", type=["csv", "xlsx", "xls", "json", "parquet"], help="CSV / Excel / JSON / Parquet")
+    uploaded = st.file_uploader("حمّل Dataset", type=["csv", "xlsx", "xls", "json", "parquet"], help="الحد المضبوط في إعدادات التطبيق يصل إلى 500 MB. ملفات Excel لها حدود داخلية حسب صيغة الملف والذاكرة المتاحة.")
     if uploaded is not None:
-        try:
-            new_df = read_dataset(uploaded)
-            if new_df.empty or len(new_df.columns) == 0:
-                st.error("الملف لا يحتوي على بيانات قابلة للقراءة.")
-            else:
-                st.session_state.df = new_df
-                st.session_state.source_name = uploaded.name
-                st.session_state.clean_df = None
-                st.session_state.trained_model = None
-                st.session_state.model_info = None
-                st.session_state.automl_results = None
-                st.session_state.outlier_df = None
-                st.session_state.cluster_df = None
-                st.success(f"تم تحميل {uploaded.name}")
-        except Exception as e:
-            st.error(f"تعذر قراءة الملف: {e}")
+        upload_signature = f"{getattr(uploaded, 'file_id', '')}:{uploaded.name}:{uploaded.size}"
+        if upload_signature != st.session_state.get("loaded_upload_signature"):
+            try:
+                with st.spinner("جاري قراءة الملف بطريقة موفرة للذاكرة... الملفات الكبيرة قد تستغرق وقتًا أطول"):
+                    new_df = read_dataset(uploaded)
+                if new_df.empty or len(new_df.columns) == 0:
+                    st.error("الملف لا يحتوي على بيانات قابلة للقراءة.")
+                else:
+                    st.session_state.df = new_df
+                    st.session_state.source_name = uploaded.name
+                    st.session_state.clean_df = None
+                    st.session_state.trained_model = None
+                    st.session_state.model_info = None
+                    st.session_state.automl_results = None
+                    st.session_state.outlier_df = None
+                    st.session_state.cluster_df = None
+                    for export_key in ("export_pdf_bytes", "export_excel_bytes", "export_csv_bytes", "export_json_bytes"):
+                        st.session_state.pop(export_key, None)
+                    gc.collect()
+                    st.session_state.loaded_upload_signature = upload_signature
+                    st.success(f"تم تحميل {uploaded.name}")
+            except Exception as e:
+                st.error(f"تعذر قراءة الملف: {e}")
     if st.session_state.df is not None:
         st.markdown("---")
         st.caption(f"الملف الحالي: {st.session_state.source_name}")
@@ -779,8 +867,10 @@ if df is None:
     st.info("ارفع ملفك من القائمة الجانبية لفتح أدوات التحليل الفعلية.")
     st.stop()
 
-df_original = df.copy()
+df_original = df
 active_df = st.session_state.clean_df if st.session_state.clean_df is not None else df_original
+large_dataset = len(active_df) > 200_000
+chart_df = plot_sample(active_df, 50_000)
 
 tabs = st.tabs(["🏠 نظرة عامة", "🔎 التحليل التلقائي", "🧹 جودة وتنظيف", "🤖 Machine Learning", "🧬 Clustering", "🚨 Anomaly Detection", "📑 التقارير والتصدير", "🗄️ SQL & Automation"])
 
@@ -788,11 +878,11 @@ with tabs[0]:
     st.markdown("### ملخص مجموعة البيانات")
     c1,c2,c3,c4,c5 = st.columns(5)
     missing_total = int(active_df.isna().sum().sum())
-    duplicate_count = int(active_df.duplicated().sum())
+    duplicate_count = safe_duplicate_count(active_df)
     with c1: metric_card("عدد الصفوف", f"{len(active_df):,}", "Records")
     with c2: metric_card("عدد الأعمدة", f"{len(active_df.columns):,}", "Features")
     with c3: metric_card("قيم مفقودة", f"{missing_total:,}", "Missing cells")
-    with c4: metric_card("صفوف مكررة", f"{duplicate_count:,}", "Duplicates")
+    with c4: metric_card("صفوف مكررة", f"{duplicate_count:,}" if duplicate_count is not None else "تخطي", "Exact check skipped above 200k rows")
     with c5: metric_card("استهلاك الذاكرة", f"{active_df.memory_usage(deep=True).sum()/1024**2:.2f} MB", "Approx.")
     st.markdown("### معاينة البيانات")
     st.dataframe(active_df.head(100), width="stretch", hide_index=True)
@@ -817,7 +907,7 @@ with tabs[0]:
         "Non-null": [int(active_df[c].notna().sum()) for c in active_df.columns],
         "Missing": [int(active_df[c].isna().sum()) for c in active_df.columns],
         "Missing %": [round(active_df[c].isna().mean()*100, 2) for c in active_df.columns],
-        "Unique": [int(active_df[c].nunique(dropna=True)) for c in active_df.columns]
+        "Unique": [(("~" if safe_unique_count(active_df[c])[1] else "") + f"{safe_unique_count(active_df[c])[0]:,}") for c in active_df.columns]
     })
     st.dataframe(profile, width="stretch", hide_index=True)
 
@@ -836,23 +926,23 @@ with tabs[1]:
         with d: metric_card("القيم الفريدة", f"{vals.nunique():,}")
         f1,f2 = st.columns(2)
         with f1:
-            fig = px.histogram(active_df, x=col, nbins=30, title=f"Distribution: {col}", template="plotly_dark")
+            fig = px.histogram(chart_df, x=col, nbins=30, title=f"Distribution: {col} (sampled for large files)", template="plotly_dark")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig, width="stretch")
         with f2:
-            fig = px.box(active_df, y=col, title=f"Outlier overview: {col}", template="plotly_dark")
+            fig = px.box(chart_df, y=col, title=f"Outlier overview: {col} (sampled for large files)", template="plotly_dark")
             fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig, width="stretch")
     if cat_cols:
         col_cat = st.selectbox("اختر عمودًا فئويًا", cat_cols, key="auto_cat_col")
-        counts = active_df[col_cat].astype("string").fillna("(Missing)").value_counts().head(20).reset_index()
+        counts = chart_df[col_cat].astype("string").fillna("(Missing)").value_counts().head(20).reset_index()
         counts.columns = [col_cat, "Count"]
         fig = px.bar(counts, x=col_cat, y="Count", title=f"Top categories: {col_cat}", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", xaxis_tickangle=-25)
         st.plotly_chart(fig, width="stretch")
     if len(num_cols) >= 2:
         st.markdown("### ارتباط الأعمدة الرقمية")
-        corr = active_df[num_cols].corr(numeric_only=True)
+        corr = chart_df[num_cols].corr(numeric_only=True)
         fig = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="Tealrose", template="plotly_dark")
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, width="stretch")
@@ -862,7 +952,8 @@ with tabs[2]:
     st.warning("التنظيف لا يغيّر الملف الأصلي؛ عند التطبيق تُحفظ نسخة منفصلة داخل الجلسة.")
     q1,q2,q3 = st.columns(3)
     with q1: metric_card("Missing cells", f"{int(active_df.isna().sum().sum()):,}")
-    with q2: metric_card("Duplicate rows", f"{int(active_df.duplicated().sum()):,}")
+    quality_duplicates = safe_duplicate_count(active_df)
+    with q2: metric_card("Duplicate rows", f"{quality_duplicates:,}" if quality_duplicates is not None else "تخطي", "Exact check skipped above 200k rows")
     with q3: metric_card("Columns with missing", f"{int((active_df.isna().sum()>0).sum()):,}")
     with st.form("clean_form"):
         drop_duplicates = st.checkbox("حذف الصفوف المكررة", value=True)
@@ -876,8 +967,10 @@ with tabs[2]:
         if trim_text:
             for c in cleaned.select_dtypes(include=["object", "string"]).columns:
                 cleaned[c] = cleaned[c].map(lambda x: x.strip() if isinstance(x, str) else x)
-        if drop_duplicates:
+        if drop_duplicates and len(cleaned) <= 200_000:
             cleaned = cleaned.drop_duplicates()
+        elif drop_duplicates:
+            st.warning("تم تخطي حذف التكرارات تلقائيًا لأن الملف أكبر من 200,000 صف لتجنب انهيار الذاكرة. يمكنك تنظيف نسخة أصغر أو استخدام أداة معالجة خارجية للملفات الضخمة.")
         for c in cleaned.columns:
             if pd.api.types.is_numeric_dtype(cleaned[c]):
                 if fill_numeric == "Median" and cleaned[c].isna().any():
@@ -907,7 +1000,7 @@ with tabs[2]:
 with tabs[3]:
     st.markdown("### AutoML — تدريب ومقارنة النماذج")
     st.write("اختر عمود الهدف. سيقوم النظام بتجهيز الأعمدة الرقمية والنصية، وتعويض القيم المفقودة، وترميز الفئات داخل Pipeline لتقليل أخطاء التدريب.")
-    ml_df = active_df.copy()
+    ml_df = active_df
     candidates = infer_target_candidates(ml_df)
     if len(ml_df) < 10:
         st.error("عدد الصفوف قليل جدًا. يُفضّل توفير 10 صفوف على الأقل، ويفضل أكثر للحصول على تقييم موثوق.")
@@ -952,8 +1045,8 @@ with tabs[3]:
                                 raise ValueError("مجموعة التدريب تحتوي على فئة واحدة فقط. اختر هدفًا آخر أو زِد حجم البيانات.")
                             pre = make_preprocessor(Xtr)
                             model_specs = [
-                                ("Random Forest", RandomForestClassifier(n_estimators=180, random_state=42, class_weight="balanced", n_jobs=-1)),
-                                ("Extra Trees", ExtraTreesClassifier(n_estimators=180, random_state=42, class_weight="balanced", n_jobs=-1))
+                                ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced", n_jobs=1)),
+                                ("Extra Trees", ExtraTreesClassifier(n_estimators=100, random_state=42, class_weight="balanced", n_jobs=1))
                             ]
                             results, fitted = [], []
                             for name, estimator in model_specs:
@@ -988,8 +1081,8 @@ with tabs[3]:
                                 Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42)
                                 pre = make_preprocessor(Xtr)
                                 model_specs = [
-                                    ("Random Forest", RandomForestRegressor(n_estimators=180, random_state=42, n_jobs=-1)),
-                                    ("Extra Trees", ExtraTreesRegressor(n_estimators=180, random_state=42, n_jobs=-1))
+                                    ("Random Forest", RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=1)),
+                                    ("Extra Trees", ExtraTreesRegressor(n_estimators=100, random_state=42, n_jobs=1))
                                 ]
                                 results, fitted = [], []
                                 for name, estimator in model_specs:
@@ -1032,7 +1125,8 @@ with tabs[4]:
             if len(cluster_features) < 2:
                 st.error("اختر عمودين رقميين على الأقل.")
             else:
-                temp = active_df[cluster_features].replace([np.inf,-np.inf], np.nan).copy()
+                cluster_source = active_df if len(active_df) <= 100_000 else active_df.sample(n=100_000, random_state=42)
+                temp = cluster_source[cluster_features].replace([np.inf,-np.inf], np.nan).copy()
                 temp = temp.fillna(temp.median(numeric_only=True)).dropna()
                 if len(temp) <= k:
                     st.error("عدد الصفوف الصالحة يجب أن يكون أكبر من K.")
@@ -1069,7 +1163,8 @@ with tabs[5]:
             if not anomaly_features:
                 st.error("اختر عمودًا رقميًا واحدًا على الأقل.")
             else:
-                temp = active_df[anomaly_features].replace([np.inf,-np.inf], np.nan).copy()
+                anomaly_source = active_df if len(active_df) <= 100_000 else active_df.sample(n=100_000, random_state=42)
+                temp = anomaly_source[anomaly_features].replace([np.inf,-np.inf], np.nan).copy()
                 temp = temp.fillna(temp.median(numeric_only=True))
                 temp = temp.dropna()
                 if len(temp) < 10:
@@ -1078,7 +1173,7 @@ with tabs[5]:
                     scaled = StandardScaler().fit_transform(temp)
                     detector = IsolationForest(contamination=contamination, random_state=42, n_estimators=200)
                     labels = detector.fit_predict(scaled)
-                    out = active_df.loc[temp.index].copy()
+                    out = anomaly_source.loc[temp.index].copy()
                     out["Anomaly_Status"] = np.where(labels == -1, "Anomaly", "Normal")
                     out["Anomaly_Score"] = detector.decision_function(scaled)
                     st.session_state.outlier_df = out.sort_values("Anomaly_Score")
@@ -1097,40 +1192,60 @@ with tabs[5]:
 
 with tabs[6]:
     st.markdown("### التقارير والتصدير")
-    st.write("نزّل البيانات الحالية أو تقرير جودة بيانات احترافي بصيغة PDF.")
+    st.write("جهّز كل ملف عند الطلب فقط لتقليل استهلاك الذاكرة أثناء رفع وتحليل البيانات الكبيرة.")
     report_df = active_df
-    try:
-        pdf_report = create_pdf_quality_report(report_df, st.session_state.source_name)
-        st.download_button(
-            "📄 تنزيل تقرير جودة البيانات PDF الاحترافي",
-            data=pdf_report,
-            file_name="AI_Data_Quality_Report.pdf",
-            mime="application/pdf",
-            width="stretch"
-        )
-    except Exception as report_error:
-        st.error(f"تعذر إنشاء تقرير PDF: {report_error}")
-        st.download_button(
-            "تنزيل التقرير النصي البديل TXT",
-            data=make_report(report_df, st.session_state.source_name),
-            file_name="data_quality_report.txt",
-            mime="text/plain",
-            width="stretch"
-        )
-    c1,c2,c3 = st.columns(3)
-    with c1:
-        st.download_button("تنزيل CSV", to_csv_bytes(report_df), file_name="dataset_export.csv", mime="text/csv", width="stretch")
-    with c2:
-        st.download_button("📊 تنزيل Excel مع Dashboard", to_excel_bytes(report_df), file_name="dataset_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-    with c3:
-        st.download_button("تنزيل JSON", safe_frame(report_df).to_json(orient="records", force_ascii=False, indent=2).encode("utf-8"), file_name="dataset_export.json", mime="application/json", width="stretch")
+    if st.button("📄 تجهيز تقرير جودة البيانات PDF", width="stretch"):
+        try:
+            with st.spinner("جاري تجهيز تقرير PDF..."):
+                st.session_state.export_pdf_bytes = create_pdf_quality_report(report_df, st.session_state.source_name)
+            st.success("تم تجهيز تقرير PDF.")
+        except Exception as report_error:
+            st.error(f"تعذر إنشاء تقرير PDF: {report_error}")
+            st.session_state.export_pdf_bytes = make_report(report_df, st.session_state.source_name).encode("utf-8")
+    if st.session_state.get("export_pdf_bytes"):
+        st.download_button("⬇️ تنزيل تقرير الجودة", data=st.session_state.export_pdf_bytes,
+                           file_name="AI_Data_Quality_Report.pdf" if st.session_state.get("export_pdf_bytes", b"").startswith(b"%PDF") else "data_quality_report.txt",
+                           mime="application/pdf" if st.session_state.get("export_pdf_bytes", b"").startswith(b"%PDF") else "text/plain",
+                           width="stretch")
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        if st.button("تجهيز CSV", width="stretch"):
+            with st.spinner("جاري تجهيز CSV..."):
+                st.session_state.export_csv_bytes = to_csv_bytes(report_df)
+                gc.collect()
+        if st.session_state.get("export_csv_bytes") is not None:
+            st.download_button("تنزيل CSV", st.session_state.export_csv_bytes, file_name="dataset_export.csv", mime="text/csv", width="stretch")
+    with e2:
+        if st.button("📊 تجهيز Excel Dashboard", width="stretch"):
+            try:
+                with st.spinner("جاري إنشاء ملف Excel والرسوم..."):
+                    st.session_state.export_excel_bytes = to_excel_bytes(report_df)
+                    gc.collect()
+            except Exception as export_error:
+                st.error(f"تعذر إنشاء Excel: {export_error}. جرّب CSV إذا كان الملف قريبًا من حدود Excel.")
+        if st.session_state.get("export_excel_bytes") is not None:
+            st.download_button("تنزيل Excel مع Dashboard", st.session_state.export_excel_bytes, file_name="dataset_export.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+    with e3:
+        if st.button("تجهيز JSON", width="stretch"):
+            with st.spinner("جاري تجهيز JSON..."):
+                st.session_state.export_json_bytes = safe_frame(report_df).to_json(orient="records", force_ascii=False).encode("utf-8")
+                gc.collect()
+        if st.session_state.get("export_json_bytes") is not None:
+            st.download_button("تنزيل JSON", st.session_state.export_json_bytes, file_name="dataset_export.json", mime="application/json", width="stretch")
+
     st.markdown("### إحصاءات وصفية")
-    st.dataframe(report_df.describe(include="all").transpose(), width="stretch")
+    if len(report_df) > 200_000:
+        st.caption("للحفاظ على الذاكرة، الإحصاءات الوصفية تعرض عينة عشوائية من 100,000 صف. عدد الصفوف الأصلي يظل كما هو.")
+        stats_df = plot_sample(report_df, 100_000)
+    else:
+        stats_df = report_df
+    st.dataframe(stats_df.describe(include="all").transpose(), width="stretch")
 
 with tabs[7]:
     st.markdown("### SQL & Automation")
     st.write("صدّر نسخة من البيانات إلى قاعدة SQLite محلية، أو نزّل سكربت SQL لإنشاء جدول وإدخال البيانات.")
-    sql_df = safe_frame(active_df)
+    sql_df = active_df
     safe_table = st.text_input("اسم الجدول", value="dataset_records")
     safe_table = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in safe_table)
     if not safe_table:
